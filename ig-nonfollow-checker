@@ -1,0 +1,431 @@
+// IG Non-Follow Back Checker v2 — ทนต่อ 429 + บันทึกความคืบหน้า (ทำต่อได้)
+// วิธีใช้: เปิดหน้าโปรไฟล์ตัวเองบน instagram.com → F12 → Console → วางสคริปต์ทั้งไฟล์ → กดปุ่ม "เริ่ม / ทำต่อ"
+// ปรับค่าได้โดยตั้ง window.IG_CHECKER_CONFIG = { PAGE_DELAY_MIN: 6000, ... } ก่อนวางสคริปต์
+(async () => {
+  "use strict";
+
+  const TOOL_ID = "ig-api-nonfollow-checker";
+  document.getElementById(TOOL_ID)?.remove();
+
+  // ยกเลิกรอบเก่าที่อาจยังวิ่งอยู่ (กรณีวางสคริปต์ซ้ำ) กันการยิงซ้อนกัน
+  const myToken = {};
+  window.__igCheckerToken = myToken;
+
+  const CONFIG = Object.assign(
+    {
+      PAGE_SIZE: 30,
+      PAGE_DELAY_MIN: 4000,        // หน่วงระหว่างหน้า (ms)
+      PAGE_DELAY_MAX: 8000,
+      LIST_SWITCH_DELAY: 20000,    // พักตอนสลับจาก Following → Followers (ms)
+      MAX_RETRIES: 3,              // ลองซ้ำต่อหน้า ถ้ายังโดนจำกัดอยู่ให้หยุดและเก็บความคืบหน้า
+      BACKOFF_BASE_SEC: 90,        // 90 → 180 → 360 วินาที (ถ้ามี Retry-After จะใช้ค่านั้นแทน)
+      BACKOFF_CAP_SEC: 600,
+      BACKOFF_JITTER_SEC: 8,
+      SLOWDOWN_FACTOR: 1.5,        // โดน 429 แล้วช้าลงอีก 1.5 เท่าตลอดรอบที่เหลือ
+      SLOWDOWN_CAP: 4,
+      STATE_TTL_MS: 24 * 60 * 60 * 1000,
+      AUTO_START: false            // ไม่ยิงอัตโนมัติ เผื่อกำลังโดนจำกัดอยู่
+    },
+    window.IG_CHECKER_CONFIG || {}
+  );
+
+  if (!location.hostname.includes("instagram.com")) {
+    alert("ต้องรันบนเว็บ instagram.com เท่านั้น");
+    return;
+  }
+
+  const profileUsername = location.pathname.split("/").filter(Boolean)[0]?.toLowerCase();
+  if (!profileUsername || ["accounts", "explore", "direct", "reels", "p"].includes(profileUsername)) {
+    alert("ให้เปิดหน้าโปรไฟล์ตัวเองก่อน เช่น instagram.com/your_username/");
+    return;
+  }
+
+  const pageText = (document.body.innerText || document.body.textContent || "").toLowerCase();
+  const isOwnProfile = ["แก้ไขโปรไฟล์", "edit profile", "ดูคลัง", "view archive"].some(t => pageText.includes(t));
+  if (!isOwnProfile) {
+    alert("สคริปต์นี้ตั้งใจให้ใช้กับหน้าโปรไฟล์ของตัวเองเท่านั้น ให้เปิดหน้าโปรไฟล์ตัวเองก่อนนะ");
+    return;
+  }
+
+  // ---------- utilities ----------
+  class StopSignal extends Error {}
+  class RateLimitError extends Error {}
+  class FatalError extends Error {}
+
+  const ctl = { stop: false, running: false };
+  const cancelled = () => ctl.stop || window.__igCheckerToken !== myToken;
+  const rand = (a, b) => a + Math.floor(Math.random() * (b - a + 1));
+  const sleepRaw = ms => new Promise(r => setTimeout(r, ms));
+  const fmt = s => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+
+  // sleep ที่กดหยุดได้ทันที
+  async function sleep(ms) {
+    const end = Date.now() + ms;
+    while (Date.now() < end) {
+      if (cancelled()) throw new StopSignal("stopped");
+      await sleepRaw(Math.max(0, Math.min(500, end - Date.now())));
+    }
+  }
+
+  // รอพร้อมนับถอยหลังให้เห็นบนหน้าจอ (ไม่ดูเหมือนค้าง)
+  async function countdown(sec, reason) {
+    const end = Date.now() + sec * 1000;
+    for (;;) {
+      const left = Math.ceil((end - Date.now()) / 1000);
+      if (left <= 0) return;
+      log(`${reason} — รออีก ${fmt(left)}`);
+      await sleep(Math.min(1000, left * 1000));
+    }
+  }
+
+  let slow = 1; // ตัวคูณความช้า เพิ่มขึ้นเมื่อโดน 429
+  const pageDelay = () => sleep(rand(CONFIG.PAGE_DELAY_MIN, CONFIG.PAGE_DELAY_MAX) * slow);
+
+  // ---------- UI ----------
+  function btn(bg = "#333") {
+    return `background:${bg};color:white;border:0;border-radius:10px;padding:8px 10px;margin:4px 3px;cursor:pointer;font-size:13px;`;
+  }
+
+  function log(text) {
+    const el = document.getElementById("ig-log");
+    if (el) el.textContent = text;
+    console.log("[IG Checker]", text);
+  }
+
+  function output(text) {
+    const el = document.getElementById("ig-output");
+    if (el) el.value = text;
+  }
+
+  function createPanel() {
+    const panel = document.createElement("div");
+    panel.id = TOOL_ID;
+    panel.innerHTML = `
+      <div style="position:fixed;right:18px;bottom:18px;z-index:999999999;width:390px;max-width:calc(100vw - 36px);
+        background:#111;color:#fff;border-radius:18px;box-shadow:0 18px 60px rgba(0,0,0,.45);
+        font-family:Arial,sans-serif;overflow:hidden;">
+        <div style="padding:14px 16px;background:#1d1d1d;">
+          <b>IG Non-Follow Back Checker</b>
+          <div style="font-size:12px;opacity:.75;margin-top:4px;">
+            โหมดช้า + ทำต่อได้ | Profile: @${profileUsername}
+          </div>
+        </div>
+        <div style="padding:14px;">
+          <button id="ig-run" style="${btn("#7c3aed")}">เริ่ม / ทำต่อ</button>
+          <button id="ig-stop" style="${btn("#d97706")}">หยุด</button>
+          <button id="ig-copy" style="${btn("#2563eb")}">คัดลอกผลลัพธ์</button>
+          <button id="ig-reset" style="${btn("#4b5563")}">ล้างข้อมูลที่บันทึก</button>
+          <button id="ig-close" style="${btn("#b91c1c")}">ปิด</button>
+          <div id="ig-log" style="font-size:13px;opacity:.9;margin:10px 0;min-height:42px;line-height:1.45;">กำลังเตรียมระบบ...</div>
+          <textarea id="ig-output" placeholder="ผลลัพธ์จะขึ้นตรงนี้" style="width:100%;height:310px;resize:vertical;
+            border:0;outline:0;border-radius:12px;padding:10px;box-sizing:border-box;background:#222;color:#fff;font-size:13px;"></textarea>
+        </div>
+      </div>`;
+    document.body.appendChild(panel);
+
+    document.getElementById("ig-close").onclick = () => {
+      ctl.stop = true;
+      panel.remove();
+    };
+    document.getElementById("ig-stop").onclick = () => {
+      ctl.stop = true;
+      log("กำลังหยุด... (ความคืบหน้าถูกบันทึกไว้แล้ว)");
+    };
+    document.getElementById("ig-copy").onclick = async () => {
+      await navigator.clipboard.writeText(document.getElementById("ig-output").value);
+      log("คัดลอกผลลัพธ์แล้ว");
+    };
+    document.getElementById("ig-reset").onclick = () => {
+      if (ctl.running) return log("กด 'หยุด' ก่อน แล้วค่อยล้างข้อมูล");
+      clearSaved();
+      resetMemory();
+      output("");
+      log("ล้างข้อมูลที่บันทึกแล้ว รอบถัดไปจะดึงใหม่ทั้งหมด");
+    };
+    document.getElementById("ig-run").onclick = () => run();
+  }
+
+  // ---------- state + บันทึกความคืบหน้า ----------
+  const state = {
+    userId: null,
+    lists: { following: new Map(), followers: new Map() },
+    cursors: { following: "", followers: "" },
+    done: { following: false, followers: false },
+    savedAt: 0
+  };
+  let storageKey = null;
+
+  function resetMemory() {
+    state.lists = { following: new Map(), followers: new Map() };
+    state.cursors = { following: "", followers: "" };
+    state.done = { following: false, followers: false };
+  }
+
+  function saveState() {
+    if (!storageKey) return;
+    const pack = m => [...m.values()].map(u => [u.username, u.fullName, u.isPrivate ? 1 : 0, u.isVerified ? 1 : 0]);
+    try {
+      localStorage.setItem(
+        storageKey,
+        JSON.stringify({
+          v: 2,
+          ts: Date.now(),
+          cursors: state.cursors,
+          done: state.done,
+          following: pack(state.lists.following),
+          followers: pack(state.lists.followers)
+        })
+      );
+    } catch {
+      /* พื้นที่เต็ม/ถูกบล็อก — ทำงานต่อได้แค่ไม่มี resume */
+    }
+  }
+
+  function loadState() {
+    try {
+      const raw = localStorage.getItem(storageKey);
+      if (!raw) return false;
+      const s = JSON.parse(raw);
+      if (s.v !== 2 || Date.now() - s.ts > CONFIG.STATE_TTL_MS) {
+        localStorage.removeItem(storageKey);
+        return false;
+      }
+      const unpack = arr =>
+        new Map(arr.map(([username, fullName, p, v]) => [username, { username, fullName, isPrivate: !!p, isVerified: !!v }]));
+      state.lists.following = unpack(s.following);
+      state.lists.followers = unpack(s.followers);
+      state.cursors = s.cursors;
+      state.done = s.done;
+      state.savedAt = s.ts;
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function clearSaved() {
+    try {
+      if (storageKey) localStorage.removeItem(storageKey);
+    } catch {}
+  }
+
+  // ---------- Instagram API ----------
+  async function igFetch(url, label = "") {
+    for (let attempt = 0; attempt <= CONFIG.MAX_RETRIES; attempt++) {
+      if (cancelled()) throw new StopSignal("stopped");
+
+      let res, text;
+      try {
+        res = await fetch(url, {
+          method: "GET",
+          credentials: "include",
+          headers: {
+            accept: "application/json",
+            "x-ig-app-id": "936619743392459",
+            "x-requested-with": "XMLHttpRequest"
+          }
+        });
+        text = await res.text();
+      } catch (netErr) {
+        if (attempt === CONFIG.MAX_RETRIES) throw new Error(`เครือข่ายมีปัญหา: ${netErr.message || netErr}`);
+        await countdown(15 * (attempt + 1), `เครือข่ายมีปัญหา (${label})`);
+        continue;
+      }
+
+      const throttled =
+        res.status === 429 || (res.status === 400 && /wait a few minutes|try again later/i.test(text));
+
+      if (throttled) {
+        slow = Math.min(slow * CONFIG.SLOWDOWN_FACTOR, CONFIG.SLOWDOWN_CAP);
+        // ยังโดนอยู่หลังลองครบแล้ว: หยุดเลย อย่ายิงต่อ (ยิงต่อตอนโดนจำกัดมีแต่ทำให้โดนนานขึ้น)
+        if (attempt === CONFIG.MAX_RETRIES) {
+          throw new RateLimitError(`Instagram จำกัดความเร็ว (${res.status}) ที่ ${label}`);
+        }
+        const retryAfter = parseInt(res.headers.get("retry-after") || "", 10);
+        const base = retryAfter > 0 ? retryAfter : CONFIG.BACKOFF_BASE_SEC * 2 ** attempt;
+        const waitSec = Math.min(base, CONFIG.BACKOFF_CAP_SEC) + rand(0, CONFIG.BACKOFF_JITTER_SEC);
+        await countdown(
+          waitSec,
+          `โดนจำกัด (${res.status}) ที่ ${label} — ครั้งที่ ${attempt + 1}/${CONFIG.MAX_RETRIES}`
+        );
+        continue;
+      }
+
+      // 401/403 ไม่ใช่เรื่องความเร็ว (session หมดอายุ / ต้องยืนยันตัวตน) ลองซ้ำไปก็ไม่หาย
+      if (res.status === 401 || res.status === 403) {
+        let msg = "";
+        try {
+          msg = JSON.parse(text).message || "";
+        } catch {}
+        throw new FatalError(
+          `Instagram ปฏิเสธคำขอ (${res.status}${msg ? ": " + msg : ""})\nตรวจว่ายังล็อกอินอยู่ และไม่มีหน้ายืนยันตัวตนค้างอยู่ แล้วลองใหม่ภายหลัง`
+        );
+      }
+
+      if (!res.ok) throw new Error(`Instagram error ${res.status}\n\n${text.slice(0, 300)}`);
+
+      try {
+        return JSON.parse(text);
+      } catch {
+        throw new FatalError("Instagram ไม่ได้ส่ง JSON กลับมา (อาจ session หมดอายุ)");
+      }
+    }
+  }
+
+  // ใช้ cookie แทนการเรียก web_profile_info (endpoint นั้นโดนจำกัดบ่อย และเราไม่จำเป็นต้องยิง)
+  function getOwnUserIdFromCookie() {
+    const m = document.cookie.match(/(?:^|;\s*)ds_user_id=(\d+)/);
+    return m ? m[1] : null;
+  }
+
+  async function getUserIdViaApi(username) {
+    log(`กำลังหา user id ของ @${username}...`);
+    const data = await igFetch(`/api/v1/users/web_profile_info/?username=${encodeURIComponent(username)}`, "user id");
+    const user = data?.data?.user || data?.graphql?.user || data?.user;
+    const id = user?.id || user?.pk;
+    if (!id) throw new FatalError("หา user id ไม่เจอ");
+    return String(id);
+  }
+
+  function addUser(map, user) {
+    if (!user) return;
+    const username = String(user.username || "").trim().toLowerCase();
+    if (!username) return;
+    map.set(username, {
+      username,
+      fullName: user.full_name || user.fullName || "",
+      isPrivate: !!user.is_private,
+      isVerified: !!user.is_verified
+    });
+  }
+
+  async function fetchList(type) {
+    const map = state.lists[type];
+    const name = type === "following" ? "Following" : "Followers";
+    let page = 1;
+
+    while (!state.done[type]) {
+      const params = new URLSearchParams();
+      params.set("count", String(CONFIG.PAGE_SIZE));
+      params.set("search_surface", "follow_list_page");
+      if (state.cursors[type]) params.set("max_id", state.cursors[type]);
+
+      const label = `${name} หน้า ${page}`;
+      log(`ดึง ${label} | ได้แล้ว ${map.size} คน`);
+
+      const data = await igFetch(`/api/v1/friendships/${state.userId}/${type}/?${params}`, label);
+      const users = Array.isArray(data?.users) ? data.users : [];
+      for (const u of users) addUser(map, u);
+
+      const next = data?.next_max_id || data?.nextMaxId || data?.next_cursor || "";
+      state.cursors[type] = next ? String(next) : "";
+      if (!next || users.length === 0) state.done[type] = true;
+
+      saveState(); // บันทึกทุกหน้า — ถ้าโดนจำกัดกลางทาง รอบหน้าไม่ต้องเริ่มใหม่
+      page++;
+
+      if (page > 500) throw new Error("หยุดเพื่อความปลอดภัย (เกิน 500 หน้า)");
+      if (!state.done[type]) await pageDelay();
+    }
+  }
+
+  function compare() {
+    const notFollowBack = [];
+    for (const [username, info] of state.lists.following) {
+      if (!state.lists.followers.has(username)) notFollowBack.push(info);
+    }
+    notFollowBack.sort((a, b) => a.username.localeCompare(b.username));
+
+    output(
+      notFollowBack.length
+        ? notFollowBack.map(u => `@${u.username}${u.fullName ? ` — ${u.fullName}` : ""}`).join("\n")
+        : "ไม่เจอเลย ทุกคนที่คุณติดตาม ติดตามกลับหมดแล้ว 🎉"
+    );
+    log(
+      `เสร็จแล้ว → Following: ${state.lists.following.size} | Followers: ${state.lists.followers.size} | ไม่ติดตามกลับ: ${notFollowBack.length}`
+    );
+  }
+
+  // ---------- main ----------
+  async function run() {
+    if (ctl.running) return log("กำลังทำงานอยู่แล้ว (กันการยิงซ้อน)");
+    ctl.running = true;
+    ctl.stop = false;
+
+    try {
+      output("");
+      if (!state.userId) {
+        state.userId = getOwnUserIdFromCookie() || (await getUserIdViaApi(profileUsername));
+        storageKey = `ig_nfb_state_v2_${state.userId}`;
+        loadState();
+      }
+
+      if (state.done.following && state.done.followers) {
+        const mins = Math.round((Date.now() - state.savedAt) / 60000);
+        compare();
+        log(`ใช้ผลที่บันทึกไว้เมื่อ ~${mins} นาทีก่อน (ไม่ได้ยิง API) — ต้องการข้อมูลใหม่ให้กด "ล้างข้อมูลที่บันทึก" แล้วเริ่มอีกครั้ง`);
+        return;
+      }
+
+      const resumed = state.lists.following.size + state.lists.followers.size > 0;
+      log(resumed ? "พบความคืบหน้าเดิม กำลังทำต่อ..." : "เริ่มโหมดช้า... (อาจใช้เวลานาน)");
+
+      let fetchedFollowingNow = false;
+      if (!state.done.following) {
+        await fetchList("following");
+        fetchedFollowingNow = true;
+      }
+      if (!state.done.followers) {
+        if (fetchedFollowingNow) {
+          await countdown(CONFIG.LIST_SWITCH_DELAY / 1000, "ดึง Following เสร็จ พักก่อนดึง Followers");
+        }
+        await fetchList("followers");
+      }
+      compare();
+    } catch (err) {
+      saveState();
+      const f = state.lists.following.size;
+      const g = state.lists.followers.size;
+      const progress = `ความคืบหน้าที่บันทึกไว้: Following ${f} คน${state.done.following ? " (ครบ)" : ""} | Followers ${g} คน${state.done.followers ? " (ครบ)" : ""}`;
+
+      if (err instanceof StopSignal) {
+        log(`หยุดแล้ว — ${progress}\nกด "เริ่ม / ทำต่อ" เพื่อไปต่อจากเดิม`);
+      } else if (err instanceof RateLimitError) {
+        log("Instagram ยังจำกัดความเร็วอยู่ จึงหยุดเพื่อไม่ให้โดนหนักขึ้น");
+        output(
+          `${err.message}\n\n${progress}\n\n` +
+            "ทำอย่างนี้:\n" +
+            "1) ปิดแท็บ/แอป Instagram อื่นทั้งหมด และอย่ารีเฟรชหรือรันสคริปต์ซ้ำ\n" +
+            "2) รอประมาณ 30–60 นาที (ถ้ายังโดนอีกให้รอนานขึ้น)\n" +
+            "3) เปิดหน้าโปรไฟล์ตัวเอง วางสคริปต์ใหม่ แล้วกด \"เริ่ม / ทำต่อ\" — ระบบจะทำต่อจากเดิม ไม่ต้องดึงใหม่ทั้งหมด"
+        );
+      } else {
+        console.error(err);
+        log("เกิดข้อผิดพลาด");
+        output(`${String(err.message || err)}\n\n${progress}`);
+      }
+    } finally {
+      ctl.running = false;
+    }
+  }
+
+  // ---------- boot ----------
+  createPanel();
+  window.IGNoPopupChecker = { run, state, config: CONFIG };
+
+  state.userId = getOwnUserIdFromCookie();
+  if (state.userId) {
+    storageKey = `ig_nfb_state_v2_${state.userId}`;
+    if (loadState()) {
+      log(
+        `พบความคืบหน้าที่บันทึกไว้ (Following ${state.lists.following.size} | Followers ${state.lists.followers.size}) — กด "เริ่ม / ทำต่อ"`
+      );
+    } else {
+      log('พร้อมแล้ว — กด "เริ่ม / ทำต่อ"');
+    }
+  } else {
+    log('พร้อมแล้ว — กด "เริ่ม / ทำต่อ"');
+  }
+
+  if (CONFIG.AUTO_START) await run();
+})();
